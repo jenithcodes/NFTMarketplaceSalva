@@ -1,166 +1,518 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import "@openzeppelin/contracts/interfaces/IERC2981.sol";
+import "@openzeppelin/contracts/utils/introspection/ERC165Checker.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./Interfaces/INFTMarketplace.sol";
 
-contract Auction is Ownable {
-    INFTMarketplace public nftMarketplace;
+/**
+ * @title ERC1155Auction
+ * @dev Smart contract for auctioning both ERC1155 and ERC721 tokens
+ */
+contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
+    using ERC165Checker for address;
 
+    // Custom errors
+    error ZeroAddress();
+    error InvalidPrice();
+    error ReservePriceTooLow();
+    error InvalidERC721Amount();
+    error NotTokenOwner();
+    error ContractNotApproved();
+    error ZeroAmount();
+    error InsufficientBalance();
+    error ActiveAuctionExists();
+    error AuctionNotActive();
+    error AuctionEnded();
+    error CannotBidOnOwnAuction();
+    error BidBelowStartingPrice();
+    error BidTooLow(uint256 bid, uint256 minRequired);
+    error AuctionStillActive();
+    error TransferFailed();
+    error NoPendingReturns();
+    error FeeExceedsMax();
+    error BidIncrementZero();
+
+    // Token type enums
+    enum TokenType {
+        ERC721,
+        ERC1155
+    }
+
+    // Auction state enum
+    enum AuctionState {
+        Active,
+        Ended,
+        Cancelled
+    }
+
+    // Struct to hold auction data
     struct AuctionItem {
         uint256 tokenId;
+        uint256 amount; // Only relevant for ERC1155
+        address tokenAddress;
+        TokenType tokenType;
         address seller;
         uint256 startingPrice;
+        uint256 reservePrice;
         uint256 highestBid;
         address highestBidder;
         uint256 endTime;
-        bool active;
+        AuctionState state;
     }
 
-    mapping(uint256 => AuctionItem) public auctions;
-    mapping(uint256 => mapping(address => uint256)) public bids; // tokenId => bidder => amount
+    // Auction counter
+    uint256 private _auctionIdCounter = 1;
 
-    uint256 public constant MIN_AUCTION_DURATION = 1 days;
-    uint256 public constant MAX_AUCTION_DURATION = 7 days;
+    // Mapping from auction ID to auction item
+    mapping(uint256 => AuctionItem) private _auctions;
 
+    // Mapping from token address + token ID to auction ID
+    // tokenAddress => tokenId => amount => auctionId
+    mapping(address => mapping(uint256 => mapping(uint256 => uint256)))
+        private _tokenToAuction;
+
+    // Mapping of address to their pending returns (after being outbid)
+    mapping(address => uint256) private _pendingReturns;
+
+    // Auction fee percentage (in basis points: 250 = 2.5%)
+    uint256 public feePercentage = 250;
+
+    // Fee recipient address
+    address public feeRecipient;
+
+    // Auction duration (7 days by default)
+    uint256 public constant AUCTION_DURATION = 7 days;
+
+    // Minimum bid increment (in basis points: 500 = 5%)
+    uint256 public bidIncrementPercentage = 500;
+
+    // Events
     event AuctionCreated(
+        uint256 indexed auctionId,
+        address indexed tokenAddress,
         uint256 indexed tokenId,
-        address indexed seller,
+        uint256 amount,
+        TokenType tokenType,
+        address seller,
         uint256 startingPrice,
+        uint256 reservePrice,
         uint256 endTime
     );
+
     event BidPlaced(
-        uint256 indexed tokenId,
+        uint256 indexed auctionId,
         address indexed bidder,
-        uint256 amount
+        uint256 bidAmount
     );
-    event AuctionEnded(
-        uint256 indexed tokenId,
+
+    event AuctionComplete(
+        uint256 indexed auctionId,
         address indexed winner,
-        uint256 amount
+        uint256 winningBid,
+        uint256 fee,
+        uint256 royalty
     );
-    event AuctionCancelled(uint256 indexed tokenId);
 
-    constructor(address _nftMarketplace, address owner) Ownable(owner) {
-        nftMarketplace = INFTMarketplace(_nftMarketplace);
+    event AuctionCancelled(uint256 indexed auctionId);
+
+    event FeePercentageUpdated(uint256 newFeePercentage);
+
+    event FeeRecipientUpdated(address newFeeRecipient);
+
+    event BidIncrementUpdated(uint256 newBidIncrementPercentage);
+
+    /**
+     * @dev Constructor
+     * @param _feeRecipient Address that will receive the fees
+     */
+    constructor(address _feeRecipient) Ownable(msg.sender) {
+        if (_feeRecipient == address(0)) revert ZeroAddress();
+        feeRecipient = _feeRecipient;
     }
 
+    /**
+     * @dev Create a new auction
+     * @param tokenAddress The address of the token contract
+     * @param tokenId The ID of the token
+     * @param amount The amount of tokens (for ERC1155, use 1 for ERC721)
+     * @param tokenType The type of token (0 for ERC721, 1 for ERC1155)
+     * @param startingPrice The starting price of the auction
+     * @param reservePrice The reserve price (minimum price to sell)
+     */
     function createAuction(
+        address tokenAddress,
         uint256 tokenId,
+        uint256 amount,
+        TokenType tokenType,
         uint256 startingPrice,
-        uint256 duration
-    ) public {
-        require(
-            nftMarketplace.ownerOf(tokenId) == msg.sender,
-            "Only the owner can create an auction"
-        );
-        require(!auctions[tokenId].active, "Auction already active");
-        require(
-            duration >= MIN_AUCTION_DURATION &&
-                duration <= MAX_AUCTION_DURATION,
-            "Invalid auction duration"
-        );
+        uint256 reservePrice
+    ) external nonReentrant {
+        if (tokenAddress == address(0)) revert ZeroAddress();
+        if (startingPrice == 0) revert InvalidPrice();
+        if (reservePrice < startingPrice) revert ReservePriceTooLow();
 
-        // Transfer the NFT to the auction contract
-        nftMarketplace.transferFrom(msg.sender, address(this), tokenId);
+        // For ERC721, amount should always be 1
+        if (tokenType == TokenType.ERC721) {
+            if (amount != 1) revert InvalidERC721Amount();
 
-        auctions[tokenId] = AuctionItem({
-            tokenId: tokenId,
-            seller: msg.sender,
-            startingPrice: startingPrice,
-            highestBid: 0,
-            highestBidder: address(0),
-            endTime: block.timestamp + duration,
-            active: true
-        });
+            // Check if sender owns the token
+            if (IERC721(tokenAddress).ownerOf(tokenId) != msg.sender)
+                revert NotTokenOwner();
 
-        emit AuctionCreated(
-            tokenId,
-            msg.sender,
-            startingPrice,
-            block.timestamp + duration
-        );
-    }
+            // Check if contract is approved to transfer the token
+            if (
+                !IERC721(tokenAddress).isApprovedForAll(
+                    msg.sender,
+                    address(this)
+                ) && IERC721(tokenAddress).getApproved(tokenId) != address(this)
+            ) {
+                revert ContractNotApproved();
+            }
 
-    function placeBid(uint256 tokenId) public payable {
-        AuctionItem storage auction = auctions[tokenId];
-        require(auction.active, "Auction is not active");
-        require(block.timestamp < auction.endTime, "Auction has ended");
-        require(
-            msg.value > auction.highestBid && msg.value > auction.startingPrice,
-            "Bid too low"
-        );
-
-        // Refund the previous highest bidder
-        if (auction.highestBidder != address(0)) {
-            payable(auction.highestBidder).transfer(auction.highestBid);
-        }
-
-        auction.highestBid = msg.value;
-        auction.highestBidder = msg.sender;
-        bids[tokenId][msg.sender] = msg.value;
-
-        emit BidPlaced(tokenId, msg.sender, msg.value);
-    }
-
-    function endAuction(uint256 tokenId) public {
-        AuctionItem storage auction = auctions[tokenId];
-        require(auction.active, "Auction is not active");
-        require(block.timestamp >= auction.endTime, "Auction has not ended");
-        require(
-            auction.seller == msg.sender || auction.highestBidder == msg.sender,
-            "Only seller or highest bidder can end auction"
-        );
-
-        auction.active = false;
-
-        if (auction.highestBidder != address(0)) {
-            // Transfer NFT to the highest bidder
-            nftMarketplace.transferFrom(
+            // Transfer the token to this contract
+            IERC721(tokenAddress).safeTransferFrom(
+                msg.sender,
                 address(this),
-                auction.highestBidder,
                 tokenId
             );
-            // Transfer the highest bid to the seller
-            payable(auction.seller).transfer(auction.highestBid);
-
-            emit AuctionEnded(
-                tokenId,
-                auction.highestBidder,
-                auction.highestBid
-            );
         } else {
-            // If no bids were placed, return the NFT to the seller
-            nftMarketplace.transferFrom(address(this), auction.seller, tokenId);
-            emit AuctionCancelled(tokenId);
+            // ERC1155
+            if (amount == 0) revert ZeroAmount();
+
+            // Check if sender has enough balance
+            if (IERC1155(tokenAddress).balanceOf(msg.sender, tokenId) < amount)
+                revert InsufficientBalance();
+
+            // Check if contract is approved to transfer the tokens
+            if (
+                !IERC1155(tokenAddress).isApprovedForAll(
+                    msg.sender,
+                    address(this)
+                )
+            ) revert ContractNotApproved();
+
+            // Transfer the tokens to this contract
+            IERC1155(tokenAddress).safeTransferFrom(
+                msg.sender,
+                address(this),
+                tokenId,
+                amount,
+                ""
+            );
         }
+
+        // Ensure no active auction exists for this token
+        if (
+            _tokenToAuction[tokenAddress][tokenId][amount] != 0 &&
+            _auctions[_tokenToAuction[tokenAddress][tokenId][amount]].state ==
+            AuctionState.Active
+        ) {
+            revert ActiveAuctionExists();
+        }
+
+        // Create new auction
+        uint256 auctionId = _auctionIdCounter++;
+        uint256 endTime = block.timestamp + AUCTION_DURATION;
+
+        _auctions[auctionId] = AuctionItem({
+            tokenId: tokenId,
+            amount: amount,
+            tokenAddress: tokenAddress,
+            tokenType: tokenType,
+            seller: msg.sender,
+            startingPrice: startingPrice,
+            reservePrice: reservePrice,
+            highestBid: 0,
+            highestBidder: address(0),
+            endTime: endTime,
+            state: AuctionState.Active
+        });
+
+        // Update token to auction mapping
+        _tokenToAuction[tokenAddress][tokenId][amount] = auctionId;
+
+        emit AuctionCreated(
+            auctionId,
+            tokenAddress,
+            tokenId,
+            amount,
+            tokenType,
+            msg.sender,
+            startingPrice,
+            reservePrice,
+            endTime
+        );
     }
 
-    function cancelAuction(uint256 tokenId) public {
-        AuctionItem storage auction = auctions[tokenId];
-        require(auction.active, "Auction is not active");
-        require(auction.seller == msg.sender, "Only seller can cancel auction");
-        require(block.timestamp < auction.endTime, "Auction has ended");
+    /**
+     * @dev Place a bid on an auction
+     * @param auctionId The ID of the auction
+     */
+    function placeBid(uint256 auctionId) external payable nonReentrant {
+        AuctionItem storage auction = _auctions[auctionId];
 
-        auction.active = false;
+        if (auction.state != AuctionState.Active) revert AuctionNotActive();
+        if (block.timestamp >= auction.endTime) revert AuctionEnded();
+        if (msg.sender == auction.seller) revert CannotBidOnOwnAuction();
 
-        // Refund the highest bidder
-        if (auction.highestBidder != address(0)) {
-            payable(auction.highestBidder).transfer(auction.highestBid);
+        // If no previous bid, must be at least starting price
+        if (auction.highestBid == 0) {
+            if (msg.value < auction.startingPrice)
+                revert BidBelowStartingPrice();
+        } else {
+            // Must outbid highest bidder by at least the increment percentage
+            uint256 minBidIncrement = (auction.highestBid *
+                bidIncrementPercentage) / 10000;
+            uint256 minRequired = auction.highestBid + minBidIncrement;
+
+            if (msg.value < minRequired)
+                revert BidTooLow(msg.value, minRequired);
         }
 
-        // Return the NFT to the seller
-        nftMarketplace.transferFrom(address(this), auction.seller, tokenId);
+        // Store the previous highest bidder to refund them
+        address previousBidder = auction.highestBidder;
+        uint256 previousBid = auction.highestBid;
 
-        emit AuctionCancelled(tokenId);
+        // Update auction with new highest bid
+        auction.highestBid = msg.value;
+        auction.highestBidder = msg.sender;
+
+        // Refund the previous highest bidder
+        if (previousBidder != address(0)) {
+            _pendingReturns[previousBidder] += previousBid;
+        }
+
+        emit BidPlaced(auctionId, msg.sender, msg.value);
     }
 
-    function withdrawFunds(uint256 tokenId) public {
-        uint256 amount = bids[tokenId][msg.sender];
-        require(amount > 0, "No funds to withdraw");
+    /**
+     * @dev End an auction after its end time
+     * @param auctionId The ID of the auction
+     */
+    function endAuction(uint256 auctionId) external nonReentrant {
+        AuctionItem storage auction = _auctions[auctionId];
 
-        bids[tokenId][msg.sender] = 0;
-        payable(msg.sender).transfer(amount);
+        if (auction.state != AuctionState.Active) revert AuctionNotActive();
+        if (block.timestamp < auction.endTime && msg.sender != auction.seller)
+            revert AuctionStillActive();
+
+        auction.state = AuctionState.Ended;
+
+        // If there were no bids or reserve price not met, return the token to the seller
+        if (
+            auction.highestBidder == address(0) ||
+            auction.highestBid < auction.reservePrice
+        ) {
+            _transferToken(
+                auction.tokenAddress,
+                auction.tokenId,
+                auction.amount,
+                auction.tokenType,
+                address(this),
+                auction.seller
+            );
+
+            // If there was a bidder but reserve not met, refund the highest bidder
+            if (auction.highestBidder != address(0)) {
+                _pendingReturns[auction.highestBidder] += auction.highestBid;
+            }
+
+            emit AuctionComplete(auctionId, address(0), 0, 0, 0);
+            return;
+        }
+
+        // Calculate fee and royalty
+        uint256 saleAmount = auction.highestBid;
+        uint256 fee = (saleAmount * feePercentage) / 10000;
+        uint256 royalty = 0;
+        address royaltyRecipient = address(0);
+
+        // Check for royalty support (ERC2981)
+        if (
+            auction.tokenAddress.supportsInterface(type(IERC2981).interfaceId)
+        ) {
+            (royaltyRecipient, royalty) = IERC2981(auction.tokenAddress)
+                .royaltyInfo(auction.tokenId, saleAmount);
+
+            // If there's a valid royalty, pay it out
+            if (royaltyRecipient != address(0) && royalty > 0) {
+                // Ensure the royalty is not more than the sale amount
+                if (royalty > saleAmount - fee) {
+                    royalty = saleAmount - fee;
+                }
+
+                // Transfer royalty to recipient
+                if (royalty > 0) {
+                    (bool royaltySuccess, ) = royaltyRecipient.call{
+                        value: royalty
+                    }("");
+                    if (!royaltySuccess) revert TransferFailed();
+                }
+            }
+        }
+
+        // Transfer platform fee
+        if (fee > 0) {
+            (bool feeSuccess, ) = feeRecipient.call{value: fee}("");
+            if (!feeSuccess) revert TransferFailed();
+        }
+
+        // Calculate seller amount (minus fee and royalty)
+        uint256 sellerAmount = saleAmount - fee - royalty;
+
+        // Transfer remaining funds to seller
+        (bool sellerSuccess, ) = auction.seller.call{value: sellerAmount}("");
+        if (!sellerSuccess) revert TransferFailed();
+
+        // Transfer token to highest bidder
+        _transferToken(
+            auction.tokenAddress,
+            auction.tokenId,
+            auction.amount,
+            auction.tokenType,
+            address(this),
+            auction.highestBidder
+        );
+
+        emit AuctionComplete(
+            auctionId,
+            auction.highestBidder,
+            saleAmount,
+            fee,
+            royalty
+        );
+    }
+
+    /**
+     * @dev Cancel an auction (only callable by seller if no bids)
+     * @param auctionId The ID of the auction
+     */
+    function cancelAuction(uint256 auctionId) external nonReentrant {
+        AuctionItem storage auction = _auctions[auctionId];
+
+        if (auction.state != AuctionState.Active) revert AuctionNotActive();
+        if (msg.sender != auction.seller) revert NotTokenOwner();
+        if (auction.highestBidder != address(0)) revert ActiveAuctionExists();
+
+        auction.state = AuctionState.Cancelled;
+
+        // Return the token to the seller
+        _transferToken(
+            auction.tokenAddress,
+            auction.tokenId,
+            auction.amount,
+            auction.tokenType,
+            address(this),
+            auction.seller
+        );
+
+        emit AuctionCancelled(auctionId);
+    }
+
+    /**
+     * @dev Withdraw pending returns (after being outbid)
+     */
+    function withdrawPendingReturns() external nonReentrant {
+        uint256 amount = _pendingReturns[msg.sender];
+        if (amount == 0) revert NoPendingReturns();
+
+        // Zero out pending returns before sending to prevent reentrancy attacks
+        _pendingReturns[msg.sender] = 0;
+
+        (bool success, ) = msg.sender.call{value: amount}("");
+        if (!success) revert TransferFailed();
+    }
+
+    /**
+     * @dev Get an auction by ID
+     * @param auctionId The ID of the auction
+     */
+    function getAuction(
+        uint256 auctionId
+    ) external view returns (AuctionItem memory) {
+        return _auctions[auctionId];
+    }
+
+    /**
+     * @dev Get pending returns for an address
+     * @param bidder The address to check
+     */
+    function getPendingReturns(address bidder) external view returns (uint256) {
+        return _pendingReturns[bidder];
+    }
+
+    /**
+     * @dev Set fee percentage (only owner)
+     * @param _feePercentage The new fee percentage (in basis points)
+     */
+    function setFeePercentage(uint256 _feePercentage) external onlyOwner {
+        if (_feePercentage > 1000) revert FeeExceedsMax();
+        feePercentage = _feePercentage;
+        emit FeePercentageUpdated(_feePercentage);
+    }
+
+    /**
+     * @dev Set fee recipient (only owner)
+     * @param _feeRecipient The new fee recipient address
+     */
+    function setFeeRecipient(address _feeRecipient) external onlyOwner {
+        if (_feeRecipient == address(0)) revert ZeroAddress();
+        feeRecipient = _feeRecipient;
+        emit FeeRecipientUpdated(_feeRecipient);
+    }
+
+    /**
+     * @dev Set bid increment percentage (only owner)
+     * @param _bidIncrementPercentage The new bid increment percentage (in basis points)
+     */
+    function setBidIncrementPercentage(
+        uint256 _bidIncrementPercentage
+    ) external onlyOwner {
+        if (_bidIncrementPercentage == 0) revert BidIncrementZero();
+        bidIncrementPercentage = _bidIncrementPercentage;
+        emit BidIncrementUpdated(_bidIncrementPercentage);
+    }
+
+    /**
+     * @dev Check if an interface is supported
+     * @param interfaceId The interface ID to check
+     */
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view virtual override(ERC1155Holder) returns (bool) {
+        return
+            interfaceId == type(IERC721).interfaceId ||
+            interfaceId == type(IERC1155).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Internal function to transfer tokens based on their type
+     */
+    function _transferToken(
+        address tokenAddress,
+        uint256 tokenId,
+        uint256 amount,
+        TokenType tokenType,
+        address from,
+        address to
+    ) internal {
+        if (tokenType == TokenType.ERC721) {
+            IERC721(tokenAddress).safeTransferFrom(from, to, tokenId);
+        } else {
+            IERC1155(tokenAddress).safeTransferFrom(
+                from,
+                to,
+                tokenId,
+                amount,
+                ""
+            );
+        }
     }
 }
