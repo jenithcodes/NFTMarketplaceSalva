@@ -8,35 +8,44 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract MyERC1155 is ERC1155, ERC2981, Ownable {
     using Strings for uint256;
-    
+
     // Collection metadata
     string public name;
     string public symbol;
     string public baseURI;
-    
+
+    // Contract URI for OpenSea collection-level metadata
+    string private _contractURI;
+
     // Track if metadata is frozen
     bool public metadataFrozen;
-    
+
     // Initialize tracker to prevent multiple initializations
     bool private _initialized;
-    
+
     // Collaborators who can mint tokens
     mapping(address => bool) public collaborators;
-    
+
     // Token specific properties
     mapping(uint256 => string) private _tokenURIs;
     mapping(uint256 => uint256) public tokenSupply;
     mapping(uint256 => bool) public isUnique; // Indicates if token is unique (supply = 1)
-    
+
     // Mapping for token attributes/traits
     mapping(uint256 => mapping(string => string)) private _tokenAttributes;
-    
+
     // Track the next token ID to be minted
     uint256 private _nextTokenId = 1;
-    
+
     // Events
-    event TokenCreated(uint256 indexed tokenId, address indexed creator, uint256 supply, bool isUnique);
+    event TokenCreated(
+        uint256 indexed tokenId,
+        address indexed creator,
+        uint256 supply,
+        bool isUnique
+    );
     event CollectionMetadataUpdated(string name, string symbol, string baseURI);
+    event ContractURIUpdated(string contractURI);
     event MetadataFrozen();
     event CollaboratorUpdated(address indexed collaborator, bool status);
     event Initialized(address indexed owner, string name, string symbol);
@@ -44,42 +53,53 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     constructor() ERC1155("") Ownable(msg.sender) {
         // Empty constructor for clone factory pattern
     }
-    
+
     /**
      * @dev Initialize function to support clone pattern
      * @param _uri Base URI for the collection
      * @param _name Collection name
      * @param _symbol Collection symbol
      * @param initialOwner Owner of the collection
+     * @param _marketplace Marketplace address
+     * @param _newcontractURI Contract URI for OpenSea collection-level metadata
+     * @param _auction Auction address
      */
     function initialize(
         string memory _uri,
         string memory _name,
         string memory _symbol,
-        address initialOwner
+        address initialOwner,
+        string memory _newcontractURI,
+        address _marketplace,
+        address _auction
     ) external {
         require(!_initialized, "Already initialized");
         _initialized = true;
-        
+
         baseURI = _uri;
         name = _name;
         symbol = _symbol;
-        
+        _contractURI = _newcontractURI;
+        collaborators[_auction] = true;
+        collaborators[_marketplace] = true;
+
         // Set default royalty to 2.5%
         _setDefaultRoyalty(initialOwner, 250);
-        
+
         // Transfer ownership to the collection creator
         _transferOwnership(initialOwner);
-        
+
         emit Initialized(initialOwner, _name, _symbol);
     }
 
     modifier onlyOwnerOrCollaborator() {
-        require(owner() == _msgSender() || collaborators[_msgSender()], 
-            "Not owner or collaborator");
+        require(
+            owner() == _msgSender() || collaborators[_msgSender()],
+            "Not owner or collaborator"
+        );
         _;
     }
-    
+
     modifier metadataNotFrozen() {
         require(!metadataFrozen, "Metadata is frozen");
         _;
@@ -96,13 +116,13 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
         string memory tokenURI
     ) public onlyOwnerOrCollaborator returns (uint256) {
         require(supply > 0, "Supply must be positive");
-        
+
         uint256 tokenId = _nextTokenId++;
         _mint(_msgSender(), tokenId, supply, "");
         _setTokenURI(tokenId, tokenURI);
         tokenSupply[tokenId] = supply;
         isUnique[tokenId] = (supply == 1);
-        
+
         emit TokenCreated(tokenId, _msgSender(), supply, supply == 1);
         return tokenId;
     }
@@ -120,7 +140,7 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     ) public onlyOwnerOrCollaborator {
         require(tokenSupply[tokenId] > 0, "Token does not exist");
         require(!isUnique[tokenId], "Cannot mint more of a unique NFT");
-        
+
         _mint(to, tokenId, amount, "");
         tokenSupply[tokenId] += amount;
     }
@@ -136,8 +156,10 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     ) public onlyOwnerOrCollaborator {
         for (uint i = 0; i < ids.length; i++) {
             require(tokenSupply[ids[i]] > 0, "Token does not exist");
-            require(!isUnique[ids[i]] || (isUnique[ids[i]] && amounts[i] == 1), 
-                "Cannot mint multiple of a unique NFT");
+            require(
+                !isUnique[ids[i]] || (isUnique[ids[i]] && amounts[i] == 1),
+                "Cannot mint multiple of a unique NFT"
+            );
             tokenSupply[ids[i]] += amounts[i];
         }
         _mintBatch(to, ids, amounts, data);
@@ -146,11 +168,7 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     /**
      * @dev Burn tokens
      */
-    function burn(
-        address account,
-        uint256 id,
-        uint256 amount
-    ) public {
+    function burn(address account, uint256 id, uint256 amount) public {
         require(
             account == _msgSender() || isApprovedForAll(account, _msgSender()),
             "Caller is not owner nor approved"
@@ -172,7 +190,7 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
             "Caller is not owner nor approved"
         );
         _burnBatch(account, ids, amounts);
-        
+
         for (uint i = 0; i < ids.length; i++) {
             tokenSupply[ids[i]] -= amounts[i];
         }
@@ -190,14 +208,32 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
      */
     function uri(uint256 tokenId) public view override returns (string memory) {
         string memory tokenURI = _tokenURIs[tokenId];
-        
+
         // If token has specific URI, return it
         if (bytes(tokenURI).length > 0) {
             return tokenURI;
         }
-        
+
         // Otherwise use baseURI + tokenId
         return string(abi.encodePacked(baseURI, Strings.toString(tokenId)));
+    }
+
+    /**
+     * @dev Returns the URI for contract-level metadata for OpenSea
+     */
+    function contractURI() public view returns (string memory) {
+        return _contractURI;
+    }
+
+    /**
+     * @dev Set the contract URI for OpenSea collection-level metadata
+     * @param newContractURI The URI pointing to the collection metadata JSON
+     */
+    function setContractURI(
+        string memory newContractURI
+    ) public onlyOwner metadataNotFrozen {
+        _contractURI = newContractURI;
+        emit ContractURIUpdated(newContractURI);
     }
 
     /**
@@ -211,7 +247,7 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
         name = _name;
         symbol = _symbol;
         baseURI = _baseURI;
-        
+
         emit CollectionMetadataUpdated(_name, _symbol, _baseURI);
     }
 
@@ -248,9 +284,12 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     /**
      * @dev Add or remove collaborator
      */
-    function setCollaborator(address collaborator, bool status) public onlyOwner {
+    function setCollaborator(
+        address collaborator,
+        bool status
+    ) public onlyOwner {
         collaborators[collaborator] = status;
-        
+
         emit CollaboratorUpdated(collaborator, status);
     }
 
@@ -268,7 +307,10 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     /**
      * @dev Set default royalties for all tokens
      */
-    function setDefaultRoyalty(address receiver, uint96 feeNumerator) public onlyOwner {
+    function setDefaultRoyalty(
+        address receiver,
+        uint96 feeNumerator
+    ) public onlyOwner {
         _setDefaultRoyalty(receiver, feeNumerator);
     }
 
@@ -289,15 +331,12 @@ contract MyERC1155 is ERC1155, ERC2981, Ownable {
     /**
      * @dev Support for ERC2981 interface
      */
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(ERC1155, ERC2981)
-        returns (bool)
-    {
-        return 
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view override(ERC1155, ERC2981) returns (bool) {
+        return
             ERC1155.supportsInterface(interfaceId) ||
             ERC2981.supportsInterface(interfaceId) ||
             super.supportsInterface(interfaceId);
     }
-} 
+}

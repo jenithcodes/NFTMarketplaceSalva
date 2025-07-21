@@ -211,7 +211,7 @@ contract NFTSwap is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
                 requestedToken.tokenId,
                 requestedToken.amount,
                 requestedToken.tokenType,
-                msg.sender,
+            msg.sender,
                 swap.creator
             );
         }
@@ -226,9 +226,9 @@ contract NFTSwap is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
                 offeredToken.amount,
                 offeredToken.tokenType,
                 address(this),
-                msg.sender
-            );
-        }
+            msg.sender
+        );
+    }
 
         // Send ETH to the swap creator minus fee
         if (swap.ethValue > 0) {

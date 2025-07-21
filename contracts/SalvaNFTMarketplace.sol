@@ -11,6 +11,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/introspection/ERC165Checker.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
+import "./MyERC1155.sol";
+import "./Auction.sol";
 
 /**
  * @title SalvaNFT Marketplace
@@ -36,6 +38,7 @@ contract SalvaNFTMarketplace is
     error UnsupportedToken();
     error TransferFailed();
     error InvalidInterface();
+    error InvalidAuctionContract();
 
     // Token Type using smaller uint to save gas
     enum TokenType {
@@ -220,6 +223,64 @@ contract SalvaNFTMarketplace is
                 adjustedRoyaltyBasisPoints,
                 TokenType.ERC1155,
                 creator
+            );
+    }
+
+    function createERC1155DirectListing(
+        address tokenAddress,
+        uint32 quantity,
+        uint96 price,
+        uint16 royaltyBasisPoints,
+        string memory tokenURI
+    ) external payable nonReentrant returns (uint256) {
+        // Validate parameters
+        if (price == 0) revert InvalidPrice();
+        if (msg.value != listingFee) revert InsufficientFunds();
+        if (quantity == 0) revert InvalidQuantity();
+        if (royaltyBasisPoints > 5000) revert InvalidRoyalty(); // Max 50%
+        if (!tokenAddress.supportsInterface(INTERFACE_ID_ERC1155))
+            revert InvalidInterface();
+
+        // create ERC1155 token and mint it to the marketplace
+        // The createToken function returns the actual token ID created
+        uint256 actualTokenId = MyERC1155(tokenAddress).createToken(quantity, tokenURI);
+
+        uint16 finalRoyaltyBasisPoints;
+        address royaltyRecipient;
+
+        if (royaltyBasisPoints == 0) {
+            // Use default royalty from the contract if it exists
+            if (tokenAddress.supportsInterface(type(IERC2981).interfaceId)) {
+                (royaltyRecipient, finalRoyaltyBasisPoints) = _getRoyaltyInfo(
+                    tokenAddress,
+                    actualTokenId,
+                    price,
+                    0
+                );
+                // If no default royalty exists, keep it as 0
+                if (royaltyRecipient == address(0)) {
+                    finalRoyaltyBasisPoints = 0;
+                }
+            } else {
+                finalRoyaltyBasisPoints = 0;
+                royaltyRecipient = address(0);
+            }
+        } else {
+            // Use the passed royalty
+            finalRoyaltyBasisPoints = royaltyBasisPoints;
+            royaltyRecipient = msg.sender;
+        }
+
+        // Create listing with the actual token ID that was created
+        return
+            _createListing(
+                tokenAddress,
+                actualTokenId,
+                price,
+                quantity,
+                finalRoyaltyBasisPoints,
+                TokenType.ERC1155,
+                msg.sender
             );
     }
 

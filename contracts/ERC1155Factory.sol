@@ -7,9 +7,17 @@ interface IMyERC1155 {
         string memory _uri,
         string memory _name,
         string memory _symbol,
-        address initialOwner
+        address initialOwner,
+        string memory _newcontractURI,
+        address _marketplace,
+        address _auction
     ) external;
+    
+    function setContractURI(string memory newContractURI) external;
 }
+
+// Import OpenZeppelin Clones library
+import "@openzeppelin/contracts/proxy/Clones.sol";
 
 // Define factory-specific implementation
 contract ERC1155Factory {
@@ -21,6 +29,7 @@ contract ERC1155Factory {
         string name;
         string symbol;
         string baseURI;
+        string contractURI;
         address creator;
         uint256 createdAt;
         bool verified;
@@ -28,6 +37,8 @@ contract ERC1155Factory {
     
     Collection[] public collections;
     mapping(address => Collection[]) private creatorCollections;
+    address public marketplaceAddress;
+    address public auctionAddress;
     
     // Event for tracking collection creation
     event CollectionCreated(
@@ -35,6 +46,7 @@ contract ERC1155Factory {
         string name,
         string symbol,
         string baseURI,
+        string contractURI,
         address indexed creator
     );
     
@@ -45,8 +57,10 @@ contract ERC1155Factory {
      * @dev Constructor that takes the address of the MyERC1155 implementation
      * @param _implementation Address of the deployed MyERC1155 implementation
      */
-    constructor(address _implementation) {
+    constructor(address _implementation, address _marketplaceAddress, address _auctionAddress) {
         myERC1155Implementation = _implementation;
+        marketplaceAddress = _marketplaceAddress;
+        auctionAddress = _auctionAddress;
     }
 
     /**
@@ -54,18 +68,21 @@ contract ERC1155Factory {
      * @param name Collection name
      * @param symbol Collection symbol
      * @param baseURI Base URI for the collection
+     * @param contractURI URI for the OpenSea collection-level metadata
      * @return address of the created collection contract
      */
     function createCollection(
         string memory name,
         string memory symbol,
-        string memory baseURI
+        string memory baseURI,
+        string memory contractURI
     ) public returns (address) {
         // Deploy new collection using minimal proxy pattern
         address newCollectionAddress = _createClone(myERC1155Implementation);
         
         // Initialize the collection
-        IMyERC1155(newCollectionAddress).initialize(baseURI, name, symbol, msg.sender);
+        IMyERC1155(newCollectionAddress).initialize(baseURI, name, symbol, msg.sender, contractURI,marketplaceAddress, auctionAddress);
+        
         
         // Store collection metadata
         Collection memory collection = Collection({
@@ -73,6 +90,7 @@ contract ERC1155Factory {
             name: name,
             symbol: symbol,
             baseURI: baseURI,
+            contractURI: contractURI,
             creator: msg.sender,
             createdAt: block.timestamp,
             verified: false
@@ -87,6 +105,7 @@ contract ERC1155Factory {
             name,
             symbol,
             baseURI,
+            contractURI,
             msg.sender
         );
         
@@ -138,17 +157,8 @@ contract ERC1155Factory {
      * @return instance Address of the new clone
      */
     function _createClone(address implementation) internal returns (address instance) {
-        // Minimal proxy implementation (EIP-1167)
-        bytes20 implementationBytes = bytes20(implementation);
-        
-        assembly {
-            let clone := mload(0x40)
-            mstore(clone, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
-            mstore(add(clone, 0x14), implementationBytes)
-            mstore(add(clone, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
-            instance := create(0, clone, 0x37)
-        }
-        
+        // Use OpenZeppelin's Clones library instead of raw assembly
+        instance = Clones.clone(implementation);
         return instance;
     }
 }

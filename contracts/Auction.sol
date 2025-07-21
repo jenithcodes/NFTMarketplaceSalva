@@ -9,6 +9,7 @@ import "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import "@openzeppelin/contracts/utils/introspection/ERC165Checker.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "./MyERC1155.sol";
 
 /**
  * @title ERC1155Auction
@@ -20,7 +21,6 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
     // Custom errors
     error ZeroAddress();
     error InvalidPrice();
-    error ReservePriceTooLow();
     error InvalidERC721Amount();
     error NotTokenOwner();
     error ContractNotApproved();
@@ -59,7 +59,6 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
         TokenType tokenType;
         address seller;
         uint256 startingPrice;
-        uint256 reservePrice;
         uint256 highestBid;
         address highestBidder;
         uint256 endTime;
@@ -101,7 +100,6 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
         TokenType tokenType,
         address seller,
         uint256 startingPrice,
-        uint256 reservePrice,
         uint256 endTime
     );
 
@@ -142,20 +140,17 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
      * @param tokenId The ID of the token
      * @param amount The amount of tokens (for ERC1155, use 1 for ERC721)
      * @param tokenType The type of token (0 for ERC721, 1 for ERC1155)
-     * @param startingPrice The starting price of the auction
-     * @param reservePrice The reserve price (minimum price to sell)
+     * @param startingPrice The starting price of the auction (also serves as minimum price)
      */
     function createAuction(
         address tokenAddress,
         uint256 tokenId,
         uint256 amount,
         TokenType tokenType,
-        uint256 startingPrice,
-        uint256 reservePrice
+        uint256 startingPrice
     ) external nonReentrant {
         if (tokenAddress == address(0)) revert ZeroAddress();
         if (startingPrice == 0) revert InvalidPrice();
-        if (reservePrice < startingPrice) revert ReservePriceTooLow();
 
         // For ERC721, amount should always be 1
         if (tokenType == TokenType.ERC721) {
@@ -227,7 +222,6 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
             tokenType: tokenType,
             seller: msg.sender,
             startingPrice: startingPrice,
-            reservePrice: reservePrice,
             highestBid: 0,
             highestBidder: address(0),
             endTime: endTime,
@@ -245,7 +239,59 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
             tokenType,
             msg.sender,
             startingPrice,
-            reservePrice,
+            endTime
+        );
+    }
+
+    /**
+     * @dev Create a new auction with direct token creation
+     * @param tokenAddress The address of the ERC1155 token contract
+     * @param amount The amount of tokens to create and auction
+     * @param startingPrice The starting price of the auction (also serves as minimum price)
+     * @param tokenURI The URI for the token metadata
+     */
+    function createAuctionDirect(
+        address tokenAddress,
+        uint256 amount,
+        uint256 startingPrice,
+        string memory tokenURI
+    ) external nonReentrant {
+        if (tokenAddress == address(0)) revert ZeroAddress();
+        if (startingPrice == 0) revert InvalidPrice(); 
+        if (amount == 0) revert ZeroAmount();
+
+        // Create ERC1155 token and get the actual token ID created
+        // The createToken function returns the actual token ID created
+        uint256 actualTokenId = MyERC1155(tokenAddress).createToken(amount, tokenURI);
+
+        // Create auction
+        uint256 auctionId = _auctionIdCounter++;
+        uint256 endTime = block.timestamp + AUCTION_DURATION;
+
+        _auctions[auctionId] = AuctionItem({
+            tokenId: actualTokenId,
+            amount: amount,
+            tokenAddress: tokenAddress,
+            tokenType: TokenType.ERC1155,
+            seller: msg.sender,
+            startingPrice: startingPrice,
+            highestBid: 0,
+            highestBidder: address(0),
+            endTime: endTime,
+            state: AuctionState.Active
+        });
+
+        // Update token to auction mapping
+        _tokenToAuction[tokenAddress][actualTokenId][amount] = auctionId;
+
+        emit AuctionCreated(
+            auctionId,
+            tokenAddress,
+            actualTokenId,
+            amount,
+            TokenType.ERC1155,
+            msg.sender,
+            startingPrice,
             endTime
         );
     }
@@ -304,10 +350,10 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
 
         auction.state = AuctionState.Ended;
 
-        // If there were no bids or reserve price not met, return the token to the seller
+        // If there were no bids or starting price not met, return the token to the seller
         if (
             auction.highestBidder == address(0) ||
-            auction.highestBid < auction.reservePrice
+            auction.highestBid < auction.startingPrice
         ) {
             _transferToken(
                 auction.tokenAddress,
@@ -318,7 +364,7 @@ contract Auction is ERC1155Holder, ERC721Holder, ReentrancyGuard, Ownable {
                 auction.seller
             );
 
-            // If there was a bidder but reserve not met, refund the highest bidder
+            // If there was a bidder but starting price not met, refund the highest bidder
             if (auction.highestBidder != address(0)) {
                 _pendingReturns[auction.highestBidder] += auction.highestBid;
             }
